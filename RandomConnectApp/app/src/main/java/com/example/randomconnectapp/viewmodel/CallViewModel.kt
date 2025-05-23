@@ -1,445 +1,355 @@
 package com.example.randomconnectapp.viewmodel
 
-import android.app.Application 
+import android.app.Application
 import android.util.Log
-import androidx.lifecycle.AndroidViewModel 
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.randomconnectapp.MainApplication
+import com.example.randomconnectapp.agora.AgoraManager
+import com.example.randomconnectapp.agora.AgoraManagerListener
 import com.example.randomconnectapp.data.FirestoreService
-import com.example.randomconnectapp.webrtc.WebRTCManager
-import com.example.randomconnectapp.webrtc.models.CallData
-import com.example.randomconnectapp.webrtc.models.CallStatus
+// Import CallStatus if it's still used for Firestore call invitations, otherwise remove
+// import com.example.randomconnectapp.webrtc.models.CallStatus 
 import com.google.firebase.auth.FirebaseAuth
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
-import org.webrtc.*
-import java.util.UUID
+import java.util.UUID // For generating channel names
 
-class CallViewModel(application: Application) : AndroidViewModel(application) {
+// Sealed class for UI state - updated for Agora
+sealed class CallUiState {
+    object Idle : CallUiState()
+    data class Calling(val message: String, val channelName: String) : CallUiState()
+    data class Ringing(val message: String, val channelName: String, val callerId: String) : CallUiState()
+    data class Active(
+        val channelName: String,
+        val localUid: Int? = null,
+        val remoteUids: Set<Int> = emptySet(),
+        var callStatusMessage: String = "Connecting...",
+        val isLocalAudioMuted: Boolean = false,
+        val isLocalVideoMuted: Boolean = false
+        // Add other relevant fields if needed
+    ) : CallUiState() {
+        // Convenience copy function
+        fun copy(
+            channelName: String = this.channelName,
+            localUid: Int? = this.localUid,
+            remoteUids: Set<Int> = this.remoteUids,
+            callStatusMessage: String = this.callStatusMessage,
+            isLocalAudioMuted: Boolean = this.isLocalAudioMuted,
+            isLocalVideoMuted: Boolean = this.isLocalVideoMuted
+        ): Active = Active(
+            channelName, localUid, remoteUids, callStatusMessage, 
+            isLocalAudioMuted, isLocalVideoMuted
+        )
+    }
+    data class Error(val message: String) : CallUiState()
+}
+
+
+class CallViewModel(application: Application) : AndroidViewModel(application), AgoraManagerListener {
 
     private val auth = FirebaseAuth.getInstance()
-    private val firestoreService = FirestoreService()
-    private val eglBaseContext = EglBase.create().eglBaseContext 
-    // Pass application context to WebRTCManager
-    private val webRTCManager = WebRTCManager(application.applicationContext, eglBaseContext)
+    private val firestoreService = FirestoreService() // Keep for new signaling (invitations)
+    private lateinit var agoraManager: AgoraManager
 
-
-    // CallUiState now includes video tracks
     private val _callUiState = MutableStateFlow<CallUiState>(CallUiState.Idle)
-    val callUiState: StateFlow<CallUiState> = _callUiState
+    val callUiState: StateFlow<CallUiState> = _callUiState.asStateFlow()
 
-
-    private var currentCallId: String? = null
-    private var localPeerConnection: PeerConnection? = null
-    private var isCaller: Boolean = false
-
-    // Local media tracks
-    private var localAudioTrack: AudioTrack? = null
-    private var localVideoTrack: VideoTrack? = null
-
+    // Store current channel name, could be part of Active state too
+    private var currentChannelName: String? = null 
+    // private var isCaller: Boolean = false // This might be implicitly handled by state or not needed
 
     companion object {
         private const val TAG = "CallViewModel"
     }
 
-    private val peerConnectionObserver = object : PeerConnection.Observer {
-        override fun onSignalingChange(newState: PeerConnection.SignalingState?) {
-            Log.d(TAG, "SignalingState changed: $newState")
-            (_callUiState.value as? CallUiState.Active)?.let { currentState ->
-                _callUiState.value = currentState.copy(signalingState = newState)
-            }
-        }
-
-        override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
-            Log.d(TAG, "IceConnectionState changed: $newState")
-             (_callUiState.value as? CallUiState.Active)?.let { currentState ->
-                _callUiState.value = currentState.copy(iceConnectionState = newState)
-             }
-            if (newState == PeerConnection.IceConnectionState.CONNECTED) {
-                 (_callUiState.value as? CallUiState.Active)?.let { currentState ->
-                    _callUiState.value = currentState.copy(callStatusMessage = "Connected")
-                 }
-            }
-            if (newState == PeerConnection.IceConnectionState.FAILED || 
-                newState == PeerConnection.IceConnectionState.DISCONNECTED || 
-                newState == PeerConnection.IceConnectionState.CLOSED) {
-                Log.w(TAG, "ICE connection disconnected/failed/closed: $newState")
-                (_callUiState.value as? CallUiState.Active)?.let { currentState ->
-                    _callUiState.value = currentState.copy(callStatusMessage = "Call Disconnected/Failed")
-                 } ?: run { // If not in active state, maybe it's an error during setup
-                     if (_callUiState.value !is CallUiState.Error && _callUiState.value !is CallUiState.Idle) {
-                         _callUiState.value = CallUiState.Error("Call connection failed: $newState")
-                     }
-                 }
-                // Consider ending the call or attempting to reconnect based on the state
-                 // endCall() // This might be too abrupt, depends on strategy
-            }
-        }
-
-        override fun onIceConnectionReceivingChange(receiving: Boolean) {
-            Log.d(TAG, "IceConnectionReceivingChange: $receiving")
-        }
-
-        override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState?) {
-            Log.d(TAG, "IceGatheringState changed: $newState")
-        }
-
-        override fun onIceCandidate(candidate: IceCandidate?) {
-            candidate?.let {
-                Log.d(TAG, "onIceCandidate: Sending ICE candidate to remote peer")
-                currentCallId?.let { callId ->
-                    viewModelScope.launch {
-                        firestoreService.sendIceCandidate(callId, it, isCaller)
-                            .onFailure { e -> Log.e(TAG, "Error sending ICE candidate", e) }
-                    }
-                }
-            }
-        }
-
-        override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) {
-            Log.d(TAG, "onIceCandidatesRemoved: $candidates")
-        }
-
-        override fun onAddStream(stream: MediaStream?) {
-            // Deprecated, use onAddTrack instead
-            Log.d(TAG, "onAddStream: Remote stream added (deprecated)")
-        }
-
-        override fun onRemoveStream(stream: MediaStream?) {
-            Log.d(TAG, "onRemoveStream: Remote stream removed")
-             (_callUiState.value as? CallUiState.Active)?.let { currentState ->
-                 // If the main stream is removed, clear both tracks
-                _callUiState.value = currentState.copy(remoteAudioTrack = null, remoteVideoTrack = null, callStatusMessage = "Remote stream removed")
-             }
-        }
-
-        override fun onDataChannel(dataChannel: DataChannel?) {
-            Log.d(TAG, "onDataChannel: $dataChannel")
-        }
-
-        override fun onRenegotiationNeeded() {
-            Log.d(TAG, "onRenegotiationNeeded")
-        }
-
-        override fun onAddTrack(receiver: RtpReceiver?, mediaStreams: Array<out MediaStream>?) {
-            Log.d(TAG, "onAddTrack: Track added")
-            receiver?.track()?.let { track ->
-                (_callUiState.value as? CallUiState.Active)?.let { currentState ->
-                    if (track.kind() == MediaStreamTrack.AUDIO_TRACK_KIND) {
-                        Log.d(TAG, "Remote audio track received via onAddTrack")
-                        _callUiState.value = currentState.copy(
-                            remoteAudioTrack = track as AudioTrack,
-                            callStatusMessage = "Remote audio track available"
-                        )
-                    } else if (track.kind() == MediaStreamTrack.VIDEO_TRACK_KIND) {
-                        Log.d(TAG, "Remote video track received via onAddTrack")
-                        _callUiState.value = currentState.copy(
-                            remoteVideoTrack = track as VideoTrack,
-                            callStatusMessage = "Remote video track available"
-                        )
-                    }
-                }
-            }
+    init {
+        val mainApplication = application as MainApplication
+        mainApplication.rtcEngine?.let {
+            agoraManager = AgoraManager(application.applicationContext, it)
+            agoraManager.setListener(this)
+        } ?: run {
+            Log.e(TAG, "RTC Engine not available from MainApplication. AgoraManager not initialized.")
+            _callUiState.value = CallUiState.Error("Call functionality is unavailable (RTC Engine missing).")
         }
     }
-    
-    private fun initializeLocalMedia(): Boolean {
-        localAudioTrack = webRTCManager.createLocalAudioTrack()
-        localVideoTrack = webRTCManager.createLocalVideoTrack() // Create video track
-        
-        if (localAudioTrack == null || localVideoTrack == null) {
-            Log.e(TAG, "Failed to create local media tracks (audio or video).")
-            _callUiState.value = CallUiState.Error("Failed to initialize microphone or camera.")
-            return false
+
+    // --- SurfaceView Setup Methods for CallScreen ---
+    fun setupLocalVideoSurface(surfaceView: android.view.SurfaceView) {
+        if (::agoraManager.isInitialized) {
+            agoraManager.setupLocalVideo(surfaceView)
+            // Optionally start preview if not already started by joinChannel or if needed before joining
+            // agoraManager.startPreview() 
+        } else {
+            Log.e(TAG, "setupLocalVideoSurface: AgoraManager not initialized.")
         }
-        
-        // Update UI state with local tracks
-        // Need to transition to an Active state to hold these tracks
-        if (_callUiState.value !is CallUiState.Active) { // If not already active (e.g. during call setup)
-             _callUiState.value = CallUiState.Active(
-                 localAudioTrack = localAudioTrack,
-                 localVideoTrack = localVideoTrack,
-                 callStatusMessage = "Initializing media..."
-             )
-        } else { // If already active, just update tracks
-            (_callUiState.value as? CallUiState.Active)?.let {
-                 _callUiState.value = it.copy(localAudioTrack = localAudioTrack, localVideoTrack = localVideoTrack)
-            }
-        }
-        return true
     }
 
-    private fun addLocalTracksToPeerConnection() {
-        if (localPeerConnection == null) {
-            Log.e(TAG, "PeerConnection is null, cannot add tracks.")
-            return
+    fun setupRemoteVideoSurface(surfaceView: android.view.SurfaceView, remoteUid: Int) {
+        if (::agoraManager.isInitialized) {
+            agoraManager.setupRemoteVideo(surfaceView, remoteUid)
+        } else {
+            Log.e(TAG, "setupRemoteVideoSurface: AgoraManager not initialized for remote UID: $remoteUid")
         }
-        localAudioTrack?.let { localPeerConnection?.addTrack(it) }
-        localVideoTrack?.let { localPeerConnection?.addTrack(it) } // Add video track
-        Log.d(TAG, "Local audio and video tracks added to PeerConnection.")
     }
-
 
     fun startCall(targetUserId: String) {
-        val callerId = auth.currentUser?.uid
-        if (callerId == null) {
+        val currentUser = auth.currentUser
+        if (currentUser == null) {
             _callUiState.value = CallUiState.Error("User not authenticated.")
             return
         }
-        isCaller = true
-        currentCallId = UUID.randomUUID().toString() 
-        // _callUiState.value = CallUiState.Calling("Initializing call to user...") // This will be set by Active state
+        // isCaller = true // Set if needed for Firestore logic
+        val channelName = UUID.randomUUID().toString()
+        currentChannelName = channelName
+        val localUid = 0 // Agora can auto-assign UID with 0
 
-        if (!initializeLocalMedia()) return // Initialize media first
-
+        _callUiState.value = CallUiState.Calling("Initiating call...", channelName)
+        
         viewModelScope.launch {
-            val callData = CallData(
-                callId = currentCallId!!,
-                callerId = callerId,
-                calleeId = targetUserId,
-                status = CallStatus.RINGING.name
-            )
-            firestoreService.createCall(callData).fold(
+            // Firestore logic to send invitation to targetUserId with channelName
+            // This will be detailed in FirestoreService changes. For now, assume it's:
+            // firestoreService.sendCallInvitation(targetUserId, channelName, currentUser.uid)
+            // For now, we'll directly join for testing this ViewModel part.
+            // Replace with actual Firestore call later.
+            Log.d(TAG, "Simulating sending call invitation to $targetUserId for channel $channelName")
+            // Simulate success of sending invitation:
+            if (::agoraManager.isInitialized) {
+                agoraManager.joinChannel(channelName, localUid)
+            } else {
+                 _callUiState.value = CallUiState.Error("AgoraManager not initialized.")
+            }
+            // TODO: Replace above with actual firestoreService.sendCallInvitation call:
+            /*
+            firestoreService.sendCallInvitation(targetUserId, channelName, currentUser.uid).fold(
                 onSuccess = {
-                    Log.d(TAG, "Call document created successfully: $currentCallId")
-                    initializePeerConnectionAndCreateOffer(currentCallId!!, targetUserId)
-                    listenForRemoteData(currentCallId!!, targetUserId)
+                    Log.d(TAG, "Call invitation sent to $targetUserId for channel $channelName")
+                    if (::agoraManager.isInitialized) {
+                        agoraManager.joinChannel(channelName, localUid)
+                    } else {
+                         _callUiState.value = CallUiState.Error("AgoraManager not initialized.")
+                    }
                 },
                 onFailure = { e ->
-                    Log.e(TAG, "Failed to create call document", e)
-                    _callUiState.value = CallUiState.Error("Failed to initiate call. Please try again.")
+                    Log.e(TAG, "Failed to send call invitation", e)
+                    _callUiState.value = CallUiState.Error("Failed to send call invitation: ${e.message}")
+                    currentChannelName = null
                 }
             )
+            */
         }
     }
     
-    private fun initializePeerConnectionAndCreateOffer(callId: String, targetUserId: String) {
-        localPeerConnection = webRTCManager.createPeerConnection(peerConnectionObserver)
-        if (localPeerConnection == null) {
-            _callUiState.value = CallUiState.Error("Failed to create PeerConnection.")
-            return
-        }
-        addLocalTracksToPeerConnection() // Add audio and video tracks
-        
-        (_callUiState.value as? CallUiState.Active)?.let {
-            _callUiState.value = it.copy(callStatusMessage = "Calling ${targetUserId.take(8)}...")
-        }
-
-
-        webRTCManager.createOffer(localPeerConnection!!, object : WebRTCManager.SimpleSdpObserver() {
-            override fun onCreateSuccess(sdp: SessionDescription?) {
-                super.onCreateSuccess(sdp) 
-                sdp?.let { offerSdp ->
-                    Log.d(TAG, "Offer created. Sending to Firestore.")
-                    viewModelScope.launch {
-                        firestoreService.sendOfferSdp(callId, offerSdp).fold(
-                            onSuccess = { Log.d(TAG, "Offer SDP sent successfully.") },
-                            onFailure = { e ->
-                                Log.e(TAG, "Failed to send Offer SDP", e)
-                                _callUiState.value = CallUiState.Error("Failed to send call offer.")
-                            }
-                        )
-                    }
-                } ?: run {
-                     _callUiState.value = CallUiState.Error("Offer SDP was null.")
-                }
-            }
-            override fun onCreateFailure(error: String?) {
-                super.onCreateFailure(error)
-                _callUiState.value = CallUiState.Error("Failed to create offer: $error")
-            }
-             override fun onSetFailure(error: String?) { 
-                super.onSetFailure(error)
-                _callUiState.value = CallUiState.Error("Failed to set local description (offer): $error")
-            }
-        })
+    // Called when an invitation is received (e.g., from a Firestore listener in UI/Activity)
+    fun joinInvitedCall(channelName: String, callerId: String, localUid: Int = 0) {
+        currentChannelName = channelName
+        // isCaller = false // Set if needed
+        _callUiState.value = CallUiState.Ringing("Incoming call from ${callerId.take(8)}...", channelName, callerId)
+        // The UI would show ringing, and if user accepts:
+        // acceptCall(channelName, localUid)
     }
 
-
-    fun receiveCall(callId: String, callerId: String, offerSdp: SessionDescription) {
-        val calleeId = auth.currentUser?.uid
-        if (calleeId == null) {
-            _callUiState.value = CallUiState.Error("User not authenticated to receive call.")
+    // User accepts the call from UI
+    fun acceptCall(channelName: String, localUid: Int = 0) {
+        if (currentChannelName != channelName && _callUiState.value !is CallUiState.Ringing) {
+            _callUiState.value = CallUiState.Error("Invalid call state to accept.")
             return
         }
-        isCaller = false
-        currentCallId = callId
-        // _callUiState.value = CallUiState.Ringing("Incoming call from ${callerId.take(8)}...") // Will be set by Active
-
-        if (!initializeLocalMedia()) return // Initialize media first
-
-        localPeerConnection = webRTCManager.createPeerConnection(peerConnectionObserver)
-        if (localPeerConnection == null) {
-            _callUiState.value = CallUiState.Error("Failed to create PeerConnection for incoming call.")
-            return
-        }
-        addLocalTracksToPeerConnection() // Add audio and video tracks
-
-        (_callUiState.value as? CallUiState.Active)?.let {
-            _callUiState.value = it.copy(callStatusMessage = "Incoming call from ${callerId.take(8)}...")
-        }
-
-
-        webRTCManager.setRemoteDescription(localPeerConnection!!, offerSdp, object : WebRTCManager.SimpleSdpObserver() {
-            override fun onSetSuccess() {
-                super.onSetSuccess()
-                Log.d(TAG, "Remote description (offer) set successfully. Creating answer.")
-                webRTCManager.createAnswer(localPeerConnection!!, object : WebRTCManager.SimpleSdpObserver() {
-                    override fun onCreateSuccess(sdp: SessionDescription?) {
-                        super.onCreateSuccess(sdp)
-                        sdp?.let { answerSdp ->
-                            Log.d(TAG, "Answer created. Sending to Firestore.")
-                            viewModelScope.launch {
-                                firestoreService.sendAnswerSdp(callId, answerSdp).fold(
-                                    onSuccess = { Log.d(TAG, "Answer SDP sent successfully.") },
-                                    onFailure = { e ->
-                                        Log.e(TAG, "Failed to send Answer SDP", e)
-                                        _callUiState.value = CallUiState.Error("Failed to send call answer.")
-                                    }
-                                )
-                            }
-                        } ?: run {
-                             _callUiState.value = CallUiState.Error("Answer SDP was null.")
-                        }
-                    }
-                    override fun onCreateFailure(error: String?) {
-                        super.onCreateFailure(error)
-                        _callUiState.value = CallUiState.Error("Failed to create answer: $error")
-                    }
-                    override fun onSetFailure(error: String?) { 
-                        super.onSetFailure(error)
-                        _callUiState.value = CallUiState.Error("Failed to set local description (answer): $error")
-                    }
-                })
-            }
-            override fun onSetFailure(error: String?) {
-                super.onSetFailure(error)
-                _callUiState.value = CallUiState.Error("Failed to set remote description (offer): $error")
-            }
-        })
-        listenForRemoteData(callId, callerId) 
-    }
-    
-    private fun listenForRemoteData(callId: String, remoteUserId: String) {
-        viewModelScope.launch {
-            firestoreService.listenForIceCandidates(callId, !isCaller) 
-                .catch { e -> Log.e(TAG, "Error listening for ICE candidates", e) }
-                .collect { iceCandidateModel ->
-                    Log.d(TAG, "Received remote ICE candidate: ${iceCandidateModel.sdp}")
-                    localPeerConnection?.let { pc ->
-                        webRTCManager.addIceCandidate(pc, iceCandidateModel.toIceCandidate())
-                    } ?: Log.e(TAG, "PeerConnection null when trying to add remote ICE candidate.")
-                }
-        }
-        
-        viewModelScope.launch {
-            firestoreService.listenToCallData(callId)
-                .catch { e -> Log.e(TAG, "Error listening to call data updates", e) }
-                .collect { callData ->
-                    if (callData?.status == CallStatus.ENDED.name || callData?.status == CallStatus.DECLINED.name) {
-                        Log.d(TAG, "Call ended or declined by remote user. Status: ${callData.status}")
-                        (_callUiState.value as? CallUiState.Active)?.let { currentState ->
-                             _callUiState.value = currentState.copy(callStatusMessage = "Call ${callData.status?.toLowerCase()}", remoteAudioTrack = null, remoteVideoTrack = null)
-                        }
-                        cleanUp()
-                    }
-                    if (isCaller && callData?.answerSdp != null && localPeerConnection?.remoteDescription == null) {
-                        Log.d(TAG, "Caller received answer SDP via CallData listener.")
-                        onRemoteSdpReceived(callData.answerSdp.toSessionDescription())
-                    }
-                }
+         _callUiState.value = CallUiState.Active(channelName, callStatusMessage = "Joining call...")
+        if (::agoraManager.isInitialized) {
+            agoraManager.joinChannel(channelName, localUid)
+        } else {
+            _callUiState.value = CallUiState.Error("AgoraManager not initialized.")
         }
     }
 
-    fun onRemoteSdpReceived(sdp: SessionDescription) {
-        if (localPeerConnection == null) {
-            Log.e(TAG, "PeerConnection not initialized when trying to set remote SDP.")
-            _callUiState.value = CallUiState.Error("Call not properly initialized.")
+    // User declines the call from UI
+    fun declineCall(channelName: String) {
+         if (currentChannelName != channelName && (_callUiState.value as? CallUiState.Ringing)?.channelName != channelName) {
+            Log.w(TAG, "Cannot decline call, not in ringing state for $channelName")
             return
         }
-        Log.d(TAG, "Received remote SDP of type: ${sdp.type}. Setting remote description.")
-        webRTCManager.setRemoteDescription(localPeerConnection!!, sdp, object : WebRTCManager.SimpleSdpObserver() {
-            override fun onSetSuccess() {
-                super.onSetSuccess()
-                Log.d(TAG, "Remote description set successfully from onRemoteSdpReceived.")
-            }
-            override fun onSetFailure(error: String?) {
-                super.onSetFailure(error)
-                Log.e(TAG, "Failed to set remote description from onRemoteSdpReceived: $error")
-                _callUiState.value = CallUiState.Error("Failed to set remote description: $error")
-            }
-        })
+        // TODO: Update Firestore that call was declined.
+        // firestoreService.updateCallInvitationStatus(channelName, CallStatus.DECLINED.name)
+        _callUiState.value = CallUiState.Idle
+        currentChannelName = null
     }
+
 
     fun endCall() {
-        Log.d(TAG, "End call requested.")
-        (_callUiState.value as? CallUiState.Active)?.let {
-            _callUiState.value = it.copy(callStatusMessage = "Ending call...")
+        Log.d(TAG, "End call requested for channel: $currentChannelName")
+        val activeState = _callUiState.value as? CallUiState.Active
+        val callingState = _callUiState.value as? CallUiState.Calling
+        
+        val channelToLeave = activeState?.channelName ?: callingState?.channelName ?: currentChannelName
+
+        if (channelToLeave == null) {
+            Log.w(TAG, "No active or calling channel to end.")
+            cleanUpCallState() // Ensure UI is reset
+            return
         }
-        currentCallId?.let { callId ->
+
+        if (activeState != null) {
+             _callUiState.value = activeState.copy(callStatusMessage = "Ending call...")
+        } else if (callingState != null) {
+            // If in Calling state, means we haven't joined Agora channel yet, or join failed.
+            // Need to cancel the invitation in Firestore.
+             _callUiState.value = CallUiState.Idle // Go to Idle directly
+        }
+
+
+        if (::agoraManager.isInitialized) {
+            agoraManager.leaveChannel() // This will trigger onLeaveChannelSuccess
+        } else {
+            Log.w(TAG, "AgoraManager not initialized, cannot leave channel via manager. Cleaning up state.")
+            cleanUpCallState()
+        }
+
+        // Update Firestore status (e.g., call ended or invitation cancelled)
+        // This needs to be robust, e.g. using the actual channelName from the state
+        channelToLeave?.let {
             viewModelScope.launch {
-                firestoreService.updateCallStatus(callId, CallStatus.ENDED.name)
-                    .onFailure { e -> Log.e(TAG, "Error updating call status to ENDED", e) }
+                Log.d(TAG, "Updating Firestore: Call ended/cancelled for channel $it")
+                // Example: firestoreService.updateCallStatus(it, CallStatus.ENDED.name)
+                // Or firestoreService.cancelCallInvitation(it)
             }
         }
-        cleanUp()
+        // currentChannelName = null // Should be cleared in onLeaveChannel or cleanUpCallState
     }
     
-    private fun cleanUp() {
-        Log.d(TAG, "Cleaning up WebRTC resources in ViewModel.")
-        localAudioTrack?.dispose() // Explicitly dispose tracks
-        localAudioTrack = null
-        localVideoTrack?.dispose()
-        localVideoTrack = null
-        
-        localPeerConnection?.close() 
-        localPeerConnection = null
-        
+    private fun cleanUpCallState() {
+        Log.d(TAG, "Cleaning up call state in ViewModel.")
         _callUiState.value = CallUiState.Idle 
-        currentCallId = null
-        // WebRTCManager's own resources (factory, capturer, etc.) are disposed in onCleared()
+        currentChannelName = null
+        // Other local state resets if any
     }
 
+    fun toggleLocalAudioMute() {
+        (_callUiState.value as? CallUiState.Active)?.let { activeState ->
+            val newMuteState = !activeState.isLocalAudioMuted
+            if (::agoraManager.isInitialized) {
+                agoraManager.muteLocalAudioStream(newMuteState)
+                _callUiState.value = activeState.copy(isLocalAudioMuted = newMuteState)
+            }
+        }
+    }
+
+    fun toggleLocalVideoMute() {
+        (_callUiState.value as? CallUiState.Active)?.let { activeState ->
+            val newMuteState = !activeState.isLocalVideoMuted
+            if (::agoraManager.isInitialized) {
+                agoraManager.muteLocalVideoStream(newMuteState)
+                _callUiState.value = activeState.copy(isLocalVideoMuted = newMuteState)
+                 // If unmuting video, might need to call setupLocalVideo again if it was fully disabled
+                if (!newMuteState) {
+                    // agoraManager.setupLocalVideo(...) // This depends on how VideoScreen handles SurfaceView
+                }
+            }
+        }
+    }
+
+
+    // --- AgoraManagerListener Implementation ---
+    override fun onJoinChannelSuccess(channel: String, uid: Int, elapsed: Int) {
+        viewModelScope.launch {
+            Log.i(TAG, "onJoinChannelSuccess: channel=$channel, uid=$uid")
+            val currentState = _callUiState.value
+            if (currentState is CallUiState.Calling && currentState.channelName == channel) {
+                _callUiState.value = CallUiState.Active(
+                    channelName = channel, 
+                    localUid = uid, 
+                    callStatusMessage = "Connected"
+                )
+            } else if (currentState is CallUiState.Active && currentState.channelName == channel) {
+                // This can happen if we were already in Ringing and then accepted
+                 _callUiState.value = currentState.copy(localUid = uid, callStatusMessage = "Connected")
+            } else if (currentState is CallUiState.Ringing && currentState.channelName == channel) {
+                 // This case should be handled by acceptCall leading to Active, then this callback
+                 // However, if joinChannel was called directly after Ringing, update to Active
+                 _callUiState.value = CallUiState.Active(
+                    channelName = channel,
+                    localUid = uid,
+                    callStatusMessage = "Connected"
+                 )
+            }
+            currentChannelName = channel // Ensure currentChannelName is set
+        }
+    }
+
+    override fun onLeaveChannelSuccess() {
+        viewModelScope.launch {
+            Log.i(TAG, "onLeaveChannelSuccess")
+            cleanUpCallState()
+        }
+    }
+
+    override fun onUserJoined(uid: Int) {
+        viewModelScope.launch {
+            Log.i(TAG, "onUserJoined: uid=$uid")
+            (_callUiState.value as? CallUiState.Active)?.let { activeState ->
+                if (uid != activeState.localUid) { // Ensure not adding self
+                    _callUiState.value = activeState.copy(remoteUids = activeState.remoteUids + uid)
+                }
+            }
+        }
+    }
+
+    override fun onUserOffline(uid: Int, reason: Int) {
+        viewModelScope.launch {
+            Log.i(TAG, "onUserOffline: uid=$uid, reason=$reason")
+            (_callUiState.value as? CallUiState.Active)?.let { activeState ->
+                val updatedRemoteUids = activeState.remoteUids - uid
+                _callUiState.value = activeState.copy(remoteUids = updatedRemoteUids)
+                if (updatedRemoteUids.isEmpty()) {
+                    // Optional: Change status or end call if no remote users left
+                    // _callUiState.value = activeState.copy(callStatusMessage = "Remote user left")
+                    // endCall() // or just show a message
+                }
+            }
+        }
+    }
+
+    override fun onRemoteVideoStateChanged(uid: Int, state: Int, reason: Int, elapsed: Int) {
+        viewModelScope.launch {
+            Log.i(TAG, "onRemoteVideoStateChanged: uid=$uid, state=$state, reason=$reason")
+            // Example: Update UI based on remote video state.
+            // This might involve more complex state in CallUiState.Active if needed,
+            // e.g., a map of uid to their video state.
+            // For now, just logging. The VideoScreen will get this directly from AgoraManager if it
+            // sets up its own SurfaceView for remote users based on onUserJoined.
+        }
+    }
+    
+    override fun onErrorOccurred(err: Int, msg: String) {
+        viewModelScope.launch {
+            Log.e(TAG, "AgoraManager Error: $err, Message: $msg")
+            // Avoid setting generic error if already in a specific error state or idle
+            if (_callUiState.value !is CallUiState.Idle && _callUiState.value !is CallUiState.Error) {
+                 _callUiState.value = CallUiState.Error("Call error: $msg (code $err)")
+            }
+            // Consider if specific errors require leaving the channel or full cleanup
+            // if (err == io.agora.rtc2.Constants.ERR_INVALID_TOKEN || err == io.agora.rtc2.Constants.ERR_TOKEN_EXPIRED) {
+            //    cleanUpCallState() // e.g. token errors are critical
+            // }
+        }
+    }
+    
     override fun onCleared() {
         super.onCleared()
         Log.d(TAG, "CallViewModel onCleared. Ensuring cleanup.")
-        if (_callUiState.value !is CallUiState.Idle) { 
-            endCall() 
+        // If in an active call state, try to leave the channel.
+        // Check currentChannelName because onLeaveChannelSuccess might have already set state to Idle.
+        if (currentChannelName != null && _callUiState.value !is CallUiState.Idle) {
+             Log.d(TAG, "onCleared: Still in a call (channel: $currentChannelName), attempting to leave.")
+            if (::agoraManager.isInitialized) {
+                agoraManager.leaveChannel() 
+                // Note: leaveChannel is async. The actual cleanup of AgoraManager resources 
+                // (removeHandler) should happen after this or in destroy().
+            }
         }
-         webRTCManager.dispose() 
+        if (::agoraManager.isInitialized) {
+            agoraManager.destroy() // Important to remove handler and release AgoraManager resources
+        }
+        cleanUpCallState() // Ensure UI state is reset
     }
-}
-
-// Sealed class for UI state - updated for video
-sealed class CallUiState {
-    object Idle : CallUiState()
-    // Calling and Ringing can be part of Active with a specific status message
-    // For simplicity, keeping them separate if they have distinct UI representations beyond a message.
-    data class Calling(val message: String) : CallUiState() // Could be merged into Active
-    data class Ringing(val message: String) : CallUiState() // Could be merged into Active
-    
-    data class Active(
-        val callStatusMessage: String = "Connecting...",
-        val localAudioTrack: AudioTrack? = null,
-        val remoteAudioTrack: AudioTrack? = null,
-        val localVideoTrack: VideoTrack? = null,    // Added for local video
-        val remoteVideoTrack: VideoTrack? = null,   // Added for remote video
-        val signalingState: PeerConnection.SignalingState? = null,
-        val iceConnectionState: PeerConnection.IceConnectionState? = null
-    ) : CallUiState() {
-        // Convenience copy function
-        fun copy(
-            callStatusMessage: String = this.callStatusMessage,
-            localAudioTrack: AudioTrack? = this.localAudioTrack,
-            remoteAudioTrack: AudioTrack? = this.remoteAudioTrack,
-            localVideoTrack: VideoTrack? = this.localVideoTrack,
-            remoteVideoTrack: VideoTrack? = this.remoteVideoTrack,
-            signalingState: PeerConnection.SignalingState? = this.signalingState,
-            iceConnectionState: PeerConnection.IceConnectionState? = this.iceConnectionState
-        ): Active = Active(
-            callStatusMessage, localAudioTrack, remoteAudioTrack, 
-            localVideoTrack, remoteVideoTrack, 
-            signalingState, iceConnectionState
-        )
-    }
-    data class Error(val message: String) : CallUiState()
 }
